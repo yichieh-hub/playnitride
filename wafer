@@ -1,0 +1,97 @@
+import pika
+import json
+import csv
+import os
+import sys
+from datetime import datetime
+import requests
+from requests.auth import HTTPBasicAuth
+
+# === 設定參數 ===
+csv_path = r"C:\Users\***\***\***\***\***\lg_list.csv"  # 👉 CSV 檔案路徑
+queue_name = "LGE"                # 👉 Queue 名稱
+vhost_name = "APP"                # 👉 RabbitMQ vhost
+
+rabbitmq_host = "***.***.**.***"  # 👉 RabbitMQ 伺服器 IP / Host
+rabbitmq_port = ****              # 👉 AMQP Port
+web_port      = ****              # 👉 Management API Port
+
+username = "***"                  # 👉 使用者名稱
+password = "***"                  # 👉 使用者密碼
+
+
+# === 檢查 CSV 檔案是否存在，若無則建立 ===
+def ensure_csv_exists():
+    if not os.path.exists(csv_path): 
+        with open(csv_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["lotno", "waferid", "customerno", "eventtime", "status"])
+
+
+# === 檢查 queue 是否 durable ===
+def check_queue_durable():
+    url = f"http://{rabbitmq_host}:{web_port}/api/queues/{vhost_name}/{queue_name}"
+    try:
+        res = requests.get(url, auth=HTTPBasicAuth(username, password))
+        if res.status_code != 200:
+            print(f"❌ 無法檢查 queue 是否 durable（狀態碼 {res.status_code}）：{res.text}")
+            sys.exit(1)
+        data = res.json()
+        if data.get("durable") is not True:
+            print(f"❌ Queue '{queue_name}' 不是 durable，請重新建立或調整設定。")
+            sys.exit(1)
+        print(f"✅ Queue '{queue_name}' 為 durable")
+    except Exception as e:
+        print(f"❌ 檢查 durable 時發生錯誤：{e}")
+        sys.exit(1)
+
+
+# === 接收到訊息的 callback ===
+def callback(ch, method, properties, body):
+    try:
+        message = json.loads(body.decode())
+        lotno = message.get("lotno", "")
+        waferid = message.get("waferid", "")
+        customerno = message.get("customerno", "")
+        eventtime = message.get("eventtime", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        with open(csv_path, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([lotno, waferid, customerno, eventtime, "PENDING"])
+
+        print(f"✅ 新任務已加入：{waferid} / {lotno}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)  # ✅ 手動 ack 成功
+    except Exception as e:
+        print(f"❌ 處理訊息時出錯：{e}")
+        # 不 ack，讓訊息保留在 queue 中等待下次重試
+
+
+# === 主程式：建立連線、啟動監聽 ===
+def start_consumer():
+    ensure_csv_exists()
+    check_queue_durable()
+
+    credentials = pika.PlainCredentials(username, password)
+    parameters = pika.ConnectionParameters(
+        host=rabbitmq_host,
+        port=rabbitmq_port,
+        virtual_host=vhost_name,
+        credentials=credentials
+    )
+
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+
+    # 不重新宣告 queue，避免參數不一致報錯
+    channel.basic_consume(
+        queue=queue_name,
+        on_message_callback=callback,
+        auto_ack=False  # ✅ 改為手動 ack，防止掉資料
+    )
+
+    print(f"[*] 正在監聽 queue '{queue_name}' 的任務訊息...（Ctrl+C 結束）")
+    channel.start_consuming()
+
+
+if __name__ == "__main__":
+    start_consumer()
