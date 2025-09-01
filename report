@@ -1,0 +1,124 @@
+import os
+import shutil
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Border, Side
+from datetime import datetime
+
+# === 固定參數設定 ===
+input_ids = ["****", "****", "****", "****", "****", "****"]
+summary_folder = r"C:\Users\***\***\***\***\summary"
+report_template = r"C:\Users\***\***\***\***\***\report.xlsx"
+output_folder = r"C:\Users\***\***\***\***\report"
+
+# 來源資料夾
+epi_folder = r"C:\Users\***\***\***\***\epi"
+raw_folder = r"C:\Users\***\***\***\***\raw"
+
+# 桌面根路徑（目的地）
+desktop_root = r"C:\Users\***\Desktop"
+
+# === 日期格式化（YYMMDD）===
+today_str = datetime.today().strftime('%y%m%d')
+output_filename = f"LGE_Shipping Report_{today_str}.xlsx"
+report_output = os.path.join(output_folder, output_filename)
+
+# === 顏色設定 ===
+fill_f_to_p = PatternFill(start_color="FFFAEADB", end_color="FFFAEADB", fill_type="solid")
+fill_q_to_t = PatternFill(start_color="FFDEEDF2", end_color="FFDEEDF2", fill_type="solid")
+
+# === 邊框樣式設定 ===
+thin_border = Border(
+    left=Side(style='thin'),
+    right=Side(style='thin'),
+    top=Side(style='thin'),
+    bottom=Side(style='thin')
+)
+
+# === 載入 Excel 模板 ===
+wb = load_workbook(report_template)
+ws = wb.active  # 第一張工作表
+
+# === 寫入從 B6 開始，每個 input_id 一列 ===
+start_row = 6
+
+for i, wafer_id in enumerate(input_ids):
+    row = start_row + i
+    summary_file = os.path.join(summary_folder, f"{wafer_id}.xlsx")
+
+    if not os.path.exists(summary_file):
+        print(f"❌ 找不到檔案: {summary_file}")
+        continue
+
+    try:
+        df = pd.read_excel(summary_file, header=None)
+        third_row = df.iloc[2].tolist()
+
+        for col_offset, value in enumerate(third_row):
+            col_index = 2 + col_offset  # B 欄為第 2 欄
+            col_letter = get_column_letter(col_index)
+            cell = ws[f"{col_letter}{row}"]
+            cell.value = value
+            cell.border = thin_border
+
+            # ✅ D / E 欄百分比格式
+            if col_letter in ["D", "E"] and isinstance(value, (int, float)):
+                cell.number_format = '0.00%'
+
+            # ✅ 加上底色（視欄位而定）
+            if 6 <= col_index <= 16:  # F ~ P
+                cell.fill = fill_f_to_p
+            elif 17 <= col_index <= 20:  # Q ~ T
+                cell.fill = fill_q_to_t
+
+    except Exception as e:
+        print(f"❌ 讀取或寫入錯誤 ({wafer_id}): {e}")
+
+# === 儲存結果 ===
+os.makedirs(output_folder, exist_ok=True)
+wb.save(report_output)
+print(f"✅ 已完成報表寫入，儲存為：{report_output}")
+
+# === 建立桌面資料夾（名稱 = 報表檔名，包含 .xlsx）===
+dest_folder = os.path.join(desktop_root, output_filename)
+os.makedirs(dest_folder, exist_ok=True)
+
+# === 複製報表檔案到資料夾 ===
+shutil.copy2(report_output, os.path.join(dest_folder, output_filename))
+
+# === 複製檔案的通用函式 ===
+def copy_from_folder(folder_path: str, input_ids: list, dest: str, label: str, match_mode: str):
+    if not os.path.isdir(folder_path):
+        print(f"⚠️ {label} 來源資料夾不存在：{folder_path}")
+        return 0
+    copied = 0
+    files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+    for wafer_id in input_ids:
+        if match_mode == "prefix":
+            matched = [f for f in files if f.startswith(wafer_id)]
+        else:  # suffix
+            matched = []
+            for f in files:
+                name_wo_ext, _ = os.path.splitext(f)
+                if name_wo_ext.endswith(wafer_id):
+                    matched.append(f)
+        for fname in matched:
+            src = os.path.join(folder_path, fname)
+            dst = os.path.join(dest, fname)
+            shutil.copy2(src, dst)
+            copied += 1
+            print(f"📎 {label} 已複製：{fname}")
+    return copied
+
+# === 複製 EPI (前綴符合 input_id) ===
+epi_copied = copy_from_folder(epi_folder, input_ids, dest_folder, "EPI", "prefix")
+
+# === 複製 RAW (結尾符合 input_id) ===
+raw_copied = copy_from_folder(raw_folder, input_ids, dest_folder, "RAW", "suffix")
+
+print(f"✅ 複製總結：EPI {epi_copied} 個、RAW {raw_copied} 個")
+
+# === 最後：把桌面資料夾壓縮成 ZIP ===
+zip_path = shutil.make_archive(dest_folder, 'zip', root_dir=desktop_root, base_dir=output_filename)
+print(f"✅ 已將資料夾壓縮為 ZIP：{zip_path}")
