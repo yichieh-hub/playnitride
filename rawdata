@@ -1,0 +1,379 @@
+import os
+import json
+import shutil
+import pandas as pd
+import cx_Oracle
+import psycopg2
+import pymysql
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# === 固定參數設定 ===
+task_list_path = r"C:\Users\***\***\***\***\***\list\lg_list.csv"
+raw_template_path = r"C:\Users\***\***\***\***\***\raw\raw.xlsx"
+summary_template_path = r"C:\Users\***\***\***\***\***\summary\summary.xlsx"
+raw_output_folder = r"C:\Users\***\***\***\***\***\raw"
+summary_output_folder = r"C:\Users\***\***\***\***\***\summary"
+epi_output_folder = r"C:\Users\***\***\***\***\***\epi"
+
+keep_cols = ['COL', 'ROW', 'VFLA03', 'IV3', 'WLD3', 'VFLA05', 'IV5', 'WLD5',
+             'VFLA02', 'IV2', 'WLD2', 'VFLA04', 'IV4', 'WLD4', 'VF2', 'VF1', 'IR1', 'IR2']
+
+# === 1. 讀取 PENDING 狀態的 wafer_id ===
+df_task = pd.read_csv(task_list_path, dtype=str)
+df_pending = df_task[df_task["status"].str.upper() == "PENDING"].copy()
+wafer_ids = df_pending["waferid"].dropna().unique().tolist()
+print(f"✅ 取得待處理 wafer_id：{wafer_ids}")
+
+# === 2. 從 PostgreSQL 查出最大 serial 的 EL filepath（同 serial 時選 id 最大）===
+def get_el_filepath_by_waferid(wafer_id: str) -> str:
+    conn = psycopg2.connect(
+        host="***",
+        port="***",
+        database="***",
+        user="***",
+        password="***"
+    )
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT filepath
+        FROM public.probing_el_basic
+        WHERE waferid = %s
+          AND filepath IS NOT NULL
+        ORDER BY serial DESC, id DESC
+        LIMIT 1
+    """, (wafer_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row:
+        raise ValueError(f"❌ PostgreSQL 查無 waferid = {wafer_id} 對應檔案")
+    path = row[0].replace("/", "\\")
+    return path.encode("utf-8").decode("unicode_escape")
+
+# === 2.1 依 wafer_id 取得 EPI Rawdata 檔案路徑（沿用你測試成功的邏輯）===
+def get_epi_filepath_by_waferid(wafer_id: str) -> str:
+    conn = psycopg2.connect(
+        host="***",
+        port="***",
+        database="***",
+        user="***",
+        password="***"
+    )
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT filepath
+        FROM public.epi_basic
+        WHERE waferid = %s
+          AND (datatype IS NULL OR datatype = '')
+        ORDER BY id DESC
+        LIMIT 1
+    """, (wafer_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not row or not row[0]:
+        raise ValueError(f"❌ 查無 waferid={wafer_id} 且 datatype IS NULL 的 filepath")
+
+    raw_path = row[0]
+    print("📂 DB 原始值：", raw_path)
+
+    # 1) 開頭 // → \\server
+    if raw_path.startswith("//"):
+        fixed = "\\\\" + raw_path.lstrip("/")
+    else:
+        fixed = raw_path
+
+    # 2) 其餘 / → \
+    fixed = fixed.replace("/", "\\")
+
+    return fixed
+
+# === 3. Oracle：以 WAFERNO 查 LASERMARK ===
+def get_lasermark_by_waferno(wafer_id: str) -> str:
+    dsn = cx_Oracle.makedsn("***", *** , service_name="***")
+    conn = cx_Oracle.connect(user="***", password="***", dsn=dsn)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT LASERMARK
+        FROM RPT.WAFER_BASIC_TABLE
+        WHERE WAFERNO = :wafer_id
+    """, {'wafer_id': wafer_id})
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row or row[0] is None:
+        raise ValueError(f"❌ Oracle 找不到 LASERMARK，WAFERNO = {wafer_id}")
+    return str(row[0]).strip()
+
+# === Oracle：以 WAFERID+SHIPPING_ITEM 取 VALUE（共用） ===
+def get_shipping_value(wafer_id: str, shipping_item: str):
+    dsn = cx_Oracle.makedsn("***", *** , service_name="***")
+    conn = cx_Oracle.connect(user="***", password="***", dsn=dsn)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT VALUE
+        FROM RPT.EDC_SHIPPING_VALUE
+        WHERE WAFERID = :wafer_id
+          AND SHIPPING_ITEM = :shipping_item
+          AND ROWNUM = 1
+    """, {'wafer_id': wafer_id, 'shipping_item': shipping_item})
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except Exception:
+        return str(row[0]).strip()
+
+# === 4. 處理每個 EL 檔案與 summary 檔案 ===
+processed_wafer_ids = []
+
+for wafer_id in wafer_ids:
+    try:
+        # 取得 EL 檔案路徑（PG, 取最大 serial）
+        el_path = get_el_filepath_by_waferid(wafer_id)
+        print(f"✅ {wafer_id} 的 EL 路徑為：{el_path}")
+
+        # 取得 LASERMARK（Oracle, by WAFERNO）
+        lasermark = get_lasermark_by_waferno(wafer_id)
+        print(f"✅ {wafer_id} 的 LASERMARK：{lasermark}")
+
+        # 讀取檔案與顏色
+        with open(el_path, 'rb') as f:
+            raw = f.read(10000)
+        import chardet
+        encoding = chardet.detect(raw)['encoding'] or 'utf-8'
+
+        all_data = pd.read_csv(el_path, header=None, on_bad_lines='skip', dtype=str, engine='python', encoding=encoding)
+        rgb_char = ''
+        for i in range(len(all_data)):
+            left_cell = str(all_data.iat[i, 0]).strip()
+            if left_cell.upper() == 'LOTNUMBER':
+                right_cell = str(all_data.iat[i, 1]).strip()
+                if len(right_cell) >= 9:
+                    rgb_char = right_cell[8].upper()
+                break
+
+        with open(el_path, 'r', encoding=encoding, errors='replace') as f:
+            lines = f.readlines()
+        header_row_idx = next((i for i, line in enumerate(lines) if 'COL' in line.upper() and 'ROW' in line.upper()), None)
+        if header_row_idx is None:
+            raise ValueError("❌ 找不到標題列")
+
+        df = pd.read_csv(el_path, skiprows=header_row_idx, header=0, encoding=encoding, on_bad_lines='skip')
+        existing_cols = [col for col in keep_cols if col in df.columns]
+        df = df[existing_cols].head(400)
+
+        # === 欄位轉換（COL = *** - 原值，ROW = 原值 - ***）===
+        if 'COL' in df.columns:
+            df['COL'] = *** - pd.to_numeric(df['COL'], errors='coerce')   # 原 1708
+        if 'ROW' in df.columns:
+            df['ROW'] = pd.to_numeric(df['ROW'], errors='coerce') - ***   # 原 481
+
+        # === 儲存 raw.xlsx ===
+        raw_wb = load_workbook(raw_template_path)
+        raw_ws = raw_wb.active
+        raw_ws["B3"] = lasermark  # ← 改成 LASERMARK
+        # 顏色寫入於 E 欄；依顏色決定需跳過不填的欄位
+        skip_cols_by_color = set()
+        if rgb_char in ("G", "B"):
+            skip_cols_by_color = {"I", "J", "K", "O", "P", "Q"}
+        elif rgb_char == "R":
+            skip_cols_by_color = {"F", "G", "H", "L", "M", "N"}
+
+        for i, row in df.iterrows():
+            row_idx = 5 + i
+            raw_ws[f"E{row_idx}"] = rgb_char
+            for j, col in enumerate(existing_cols):
+                # 映射到模板：C、D，E為顏色，後續從 F 起（因此 j>=2 要跳過 E）
+                col_offset = j if j < 2 else j + 1
+                col_letter = get_column_letter(3 + col_offset)  # 3->C
+                if col_letter in skip_cols_by_color:
+                    continue
+                raw_ws[f"{col_letter}{row_idx}"] = row[col]
+
+        raw_path = os.path.join(raw_output_folder, f"{rgb_char}-{lasermark}.xlsx")  # ← 檔名改用 LASERMARK
+        raw_wb.save(raw_path)
+
+        # === 1) 從 PG 取得 aoi_id / el_id（原有邏輯保留）===
+        pg_conn = psycopg2.connect(host="***", port="***", database="***", user="***", password="***")
+        pg_cursor = pg_conn.cursor()
+
+        pg_cursor.execute("""
+            SELECT id FROM public.aoi_basic
+            WHERE waferid = %s AND opno = 'WN_CPOWIA-1'
+            ORDER BY id DESC LIMIT 1
+        """, (wafer_id,))
+        row = pg_cursor.fetchone()
+        aoi_id = row[0] if row else None
+
+        pg_cursor.execute("""
+            SELECT id FROM public.probing_el_basic
+            WHERE waferid = %s AND opno = 'WN_CPOWIP-R'
+            ORDER BY id DESC LIMIT 1
+        """, (wafer_id,))
+        row = pg_cursor.fetchone()
+        el_id = row[0] if row else None
+
+        pg_cursor.close()
+        pg_conn.close()
+
+        # === 2) AOI yield ===
+        aoi_yield_ratio = None
+        if aoi_id:
+            mysql_conn = pymysql.connect(host="***", user="***", password="***", port=***, database="***")
+            with mysql_conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT yield FROM aoi_data
+                    WHERE basic_id = %s AND area = 'all' AND recipe LIKE %s
+                    ORDER BY id DESC LIMIT 1
+                """, (aoi_id, '%All'))
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    try:
+                        y = float(row[0])
+                        aoi_yield_ratio = y/100 if y > 1 else y  # 百分比或比例皆可
+                    except Exception:
+                        aoi_yield_ratio = None
+            mysql_conn.close()
+
+        # === 3) EL JSON 統計 ===
+        el_data_avg = {}
+        if el_id:
+            mysql_conn = pymysql.connect(host="***", user="***", password="***", port=***, database="***")
+            with mysql_conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT num_attribute FROM el_data
+                    WHERE basic_id = %s AND area = 'all' AND recipe LIKE %s
+                    ORDER BY id DESC LIMIT 1
+                """, (el_id, '%All'))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    try:
+                        data_json = json.loads(row[0])
+                        el_data_avg = data_json.get("avg", {})
+                    except json.JSONDecodeError:
+                        print("❌ JSON 格式錯誤")
+            mysql_conn.close()
+
+        # === 4) 400 筆規格檢查（符合比例放在 ws["D3"]）===
+        df_check = df.copy()
+        for col in ['VFLA03', 'WLD3', 'IR1', 'IR2']:
+            if col in df_check.columns:
+                df_check[col] = pd.to_numeric(df_check[col], errors='coerce')
+
+        cond_vf  = df_check['VFLA03'].between(***, ***, inclusive='both') if 'VFLA03' in df_check else False  # 原 2.4~3.1
+        cond_ir1 = (df_check['IR1'] < ***) if 'IR1' in df_check else False                                     # 原 0.1
+        cond_ir2 = (df_check['IR2'] < ***) if 'IR2' in df_check else False                                     # 原 0.15
+
+        if rgb_char == 'G':
+            cond_wld = df_check['WLD3'].between(***, ***, inclusive='both') if 'WLD3' in df_check else False   # 原 524~534
+        elif rgb_char == 'B':
+            cond_wld = df_check['WLD3'].between(***, ***, inclusive='both') if 'WLD3' in df_check else False   # 原 457~465
+        else:  # R or others: 無 WLD3 條件
+            cond_wld = True
+
+        # 將單一布林轉成等長 Series，便於逐列運算
+        if isinstance(cond_vf, bool):
+            cond_vf = pd.Series([cond_vf]*len(df_check), index=df_check.index)
+        if isinstance(cond_ir1, bool):
+            cond_ir1 = pd.Series([cond_ir1]*len(df_check), index=df_check.index)
+        if isinstance(cond_ir2, bool):
+            cond_ir2 = pd.Series([cond_ir2]*len(df_check), index=df_check.index)
+        if isinstance(cond_wld, bool):
+            cond_wld = pd.Series([cond_wld]*len(df_check), index=df_check.index)
+
+        passed = (cond_vf & cond_ir1 & cond_ir2 & cond_wld).sum()
+        conform_ratio = passed / 400  # 以 400 為分母（依需求固定）
+
+        # === 5) 從 Oracle 取得 Chip size-X / Chip size-Y ===
+        chip_size_x = get_shipping_value(wafer_id, "Chip size-X")
+        chip_size_y = get_shipping_value(wafer_id, "Chip size-Y")
+
+        # === 儲存 summary.xlsx ===
+        summary_wb = load_workbook(summary_template_path)
+        ws = summary_wb.active
+        ws["A3"] = rgb_char
+        ws["B3"] = lasermark  # ← 改成 LASERMARK
+
+        # P3/Q3：Chip size-X / Chip size-Y（Oracle）
+        if chip_size_x is not None:
+            ws["P3"] = chip_size_x
+        if chip_size_y is not None:
+            ws["Q3"] = chip_size_y
+
+        # C3：AOI yield（百分比表示）
+        if aoi_yield_ratio is not None:
+            ws["C3"] = aoi_yield_ratio
+            ws["C3"].number_format = '0.00%'
+
+        # D3：400筆符合比例（百分比表示）
+        ws["D3"] = conform_ratio
+        ws["D3"].number_format = '0.00%'
+
+        # IR1/IR2
+        ws["N3"] = el_data_avg.get("ir1")
+        ws["O3"] = el_data_avg.get("ir2")
+
+        # 顏色對應欄位
+        if rgb_char == "R":
+            ws["K3"] = el_data_avg.get("vfla05")
+            ws["L3"] = el_data_avg.get("iv5")
+            ws["M3"] = el_data_avg.get("wld5")
+        elif rgb_char == "G":
+            ws["H3"] = el_data_avg.get("vfla03")
+            ws["I3"] = el_data_avg.get("iv3")
+            ws["J3"] = el_data_avg.get("wld3")
+        elif rgb_char == "B":
+            ws["E3"] = el_data_avg.get("vfla03")
+            ws["F3"] = el_data_avg.get("iv3")
+            ws["G3"] = el_data_avg.get("wld3")
+
+        # R3 / S3：Chip Thickness / Total Thickness（維持既有寫法）
+        chip_thickness = get_shipping_value(wafer_id, "Chip Thickness")
+        if chip_thickness is not None:
+            ws["R3"] = chip_thickness
+        total_thickness = get_shipping_value(wafer_id, "Total Thickness")
+        if total_thickness is not None:
+            ws["S3"] = total_thickness
+
+        summary_path = os.path.join(summary_output_folder, f"{lasermark}.xlsx")  # ← 檔名改用 LASERMARK
+        summary_wb.save(summary_path)
+
+        # === 6) 依 wafer_id 取得 EPI Rawdata 路徑並複製到本機 ===
+        epi_dest_path = None
+        try:
+            epi_src_path = get_epi_filepath_by_waferid(wafer_id)
+            print(f"🔎 EPI 原始路徑：{epi_src_path}")
+            if not os.path.exists(epi_src_path):
+                print(f"⚠️ 找不到 EPI 原始檔：{epi_src_path}（請確認網路分享/權限/路徑）")
+            else:
+                os.makedirs(epi_output_folder, exist_ok=True)
+                ext = os.path.splitext(epi_src_path)[1]  # 例如 .dat / .csv / .txt
+                epi_dest_path = os.path.join(epi_output_folder, f"{lasermark}-EPI{ext}")
+                shutil.copyfile(epi_src_path, epi_dest_path)
+                print(f"✅ 已複製 EPI Rawdata 到：{epi_dest_path}")
+        except Exception as epi_err:
+            print(f"⚠️ 複製 EPI Rawdata 失敗（wafer_id={wafer_id}）：{epi_err}")
+
+        # ✅ 三個檔案都存在才算成功
+        if (os.path.exists(raw_path)
+            and os.path.exists(summary_path)
+            and epi_dest_path is not None
+            and os.path.exists(epi_dest_path)):
+            processed_wafer_ids.append(wafer_id)
+            print(f"✅ {wafer_id} 已完成 raw / summary / epi 三檔案")
+        else:
+            print(f"⚠️ {wafer_id} 缺少檔案，未更新為 DONE")
+
+    except Exception as e:
+        print(f"❌ {wafer_id} 處理失敗：{e}")
+
+# === 5. 更新 task_list.csv 狀態 ===
+df_task.loc[df_task["waferid"].isin(processed_wafer_ids), "status"] = "DONE"
+df_task.to_csv(task_list_path, index=False)
+print(f"✅ 已更新下列 wafer 為 DONE：{processed_wafer_ids}")
